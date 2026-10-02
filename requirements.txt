@@ -1,0 +1,4 @@
+# Python dependencies for Ai-CMD-X.
+# Install with: pip install -r requirements.txt
+google-generativeai>=0.8.0
+python-dotenv>=1.0.0

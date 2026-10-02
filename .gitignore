@@ -1,0 +1,10 @@
+# Ai-CMD-X - Python dependencies
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# API key (never commit the real one)
+.env
+
+# Command history log
+history.log

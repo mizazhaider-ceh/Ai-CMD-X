@@ -89,10 +89,10 @@ AI-CMD-X isn’t just a tool —
 
 # 🔧 Installation
 
-### 1: 🔹 Must Install Required Modules
+### 1: 🔹 Install Required Modules
 
 ```sh
-pip install google-generativeai python-dotenv
+pip install -r requirements.txt
 ```
 
 ### 2: 🔹 Clone the Repository
@@ -134,6 +134,14 @@ Done! 🚀
 
 * API Key is stored **locally** in `.env`.
 * Never exposed or sent elsewhere.
+* Every generated command goes through an AI risk check. If the check is inconclusive or fails, the command is treated as risky and you are asked before anything runs.
+
+## 🧪 Running the Tests
+
+```sh
+pip install pytest
+python -m pytest tests/ -v
+```
 
 ## 👨‍💻 Author
 

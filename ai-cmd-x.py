@@ -20,13 +20,22 @@ yellow = "\033[93m"      # Adding yellow for warnings
 reset = "\033[0m"        # IMPORTANT: gotta reset the color back to normal, or everything stays colored!
 #========================================================================
 
+# --- Paths (relative to this script, so it works from any working directory) ---
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(SCRIPT_DIR, ".env")
+ALIAS_PATH = os.path.join(SCRIPT_DIR, ".px_aliases")
+HISTORY_PATH = os.path.join(SCRIPT_DIR, "history.log")
+
+# --- AI model used for command generation and risk checks ---
+AI_MODEL_NAME = "gemini-2.0-flash"
+
 # Function to check if we have that .env file with the API key
 # tries to be smart about loading the key
 def load_api_key():
     """Check if .env exists n load the API key, otherwise bug the user for it."""
-    if os.path.exists(".env"):
+    if os.path.exists(ENV_PATH):
         print(f"{blue}Found the .env file, nice! Lemme see if the key's in there...{reset}")
-        load_dotenv()
+        load_dotenv(ENV_PATH)
         api_key = os.getenv("GEMINI_API_KEY")
         if api_key:
             print(f"{green}Got the API key from .env! Ready to roll.{reset}")
@@ -43,25 +52,15 @@ def load_api_key():
 # This little helper function asks the user for the key and saves it
 def prompt_for_api_key():
     """Asks the user prettily for their Gemini API key and saves it to .env."""
-    api_key = input(f"{green}Please paste your Gemini API key here: {reset}").strip()
-    with open(".env", "w") as file:
+    while True:
+        api_key = input(f"{green}Please paste your Gemini API key here: {reset}").strip()
+        if api_key:
+            break
+        print(f"{red}That was empty. The key can't be blank, try again.{reset}")
+    with open(ENV_PATH, "w") as file:
         file.write(f"GEMINI_API_KEY={api_key}\n")
     print(f"{gold}Alrighty, API key saved in .env! You won't have to enter it again (unless it changes).{reset}")
     return api_key
-
-# === Part 1: Setting up the AI ===
-api_key = load_api_key()
-# Configure the genai library, adding safety settings to reduce harmful content generation
-try:
-    genai.configure(api_key=api_key)
-    # Create the model instance once here if possible, reduces overhead
-    # Using a slightly more robust model potentially, adjust if needed
-    model = genai.GenerativeModel("gemini-1.5-flash-latest")
-    print(f"{green}AI Model configured successfully with safety settings.{reset}")
-except Exception as config_err:
-    print(f"{red}Fatal Error configuring the AI Model: {config_err}{reset}")
-    print(f"{red}This might be due to an invalid API key or network issues.{reset}")
-    sys.exit(1) # Exit if we can't configure the AI
 
 # === Part 2: The Magic Prompts ===
 
@@ -99,11 +98,17 @@ Is this command potentially risky or destructive (e.g., irreversible data deleti
 Do not add any other text, greetings, or explanations. Focus solely on risk assessment.
 """
 
+
 # *NEW* Function to validate command risk using the AI
 def validate_command_risk(command_to_check):
-    """Asks the AI if a given command is risky and returns the risk explanation or None."""
+    """Asks the AI if a given command is risky.
+
+    Returns None when the command is assessed safe, otherwise returns a
+    human-readable risk message. Unknown or failed assessments are treated
+    as risky (fail closed) so the user always gets asked before running.
+    """
     if not command_to_check:
-        return None # Cannot validate an empty command
+        return "Empty command, nothing to validate."
 
     try:
         prompt = risk_check_prompt.replace("{COMMAND}", command_to_check)
@@ -118,18 +123,41 @@ def validate_command_risk(command_to_check):
             elif response_text == "Safe":
                 return None # Command is considered safe
             else:
-                # Unexpected response from the risk check prompt
-                print(f"{yellow}Warning: Unexpected response during risk check: {response_text}{reset}")
-                return None # Treat unexpected response as non-risky for safety, or handle differently if needed
+                # Unexpected response format, don't assume safe
+                return (f"AI gave an unexpected risk assessment ('{response_text}'). "
+                        "Treating the command as potentially risky.")
         else:
-            print(f"{yellow}Warning: Could not get a risk assessment response from the AI.{reset}")
-            return None # Treat no response as non-risky
+            return "AI returned no risk assessment. Treating the command as potentially risky."
 
     except Exception as e:
-        print(f"{red}Error during command risk validation: {e}{reset}")
-        # In case of error, maybe default to treating as potentially risky or just skip check?
-        # For now, let's return None (treat as not explicitly risky) but log the error.
-        return None
+        return f"Risk check failed ({e}). Treating the command as potentially risky."
+
+# *NEW* Helper that parses the AI's "command\nExplanation: ..." reply.
+# Kept separate from the API call so it can be unit tested.
+def parse_ai_response(response_text):
+    """Parses the AI's command+explanation reply.
+
+    Returns (command, explanation, warning). warning is a short note when
+    the reply didn't match the expected format, otherwise None.
+    """
+    lines = response_text.strip().split('\n', 1) # Split into max 2 parts (command and maybe explanation)
+
+    command = lines[0].strip()
+    explanation = ""
+    warning = None
+
+    if not command: # If the first line (command) is empty, it's an error
+        return None, "", "AI response did not contain a command."
+
+    if len(lines) > 1 and lines[1].strip().startswith("Explanation:"):
+        explanation = lines[1].replace("Explanation:", "", 1).strip() # Use replace with count 1
+    elif len(lines) == 1:
+        warning = "AI only provided the command, no explanation line found."
+    else:
+        warning = f"AI response format might be unexpected. Got:\n{response_text.strip()}"
+        # Still try to return the first line as command
+
+    return command, explanation, warning
 
 # *MODIFIED* Function that takes the user's wish and gets the command AND explanation from Gemini
 def gemini_command_and_explanation(user_input):
@@ -144,24 +172,11 @@ def gemini_command_and_explanation(user_input):
 
         # Check for valid response and text
         if response and response.text and response.text.strip():
-            response_text = response.text.strip()
-            lines = response_text.split('\n', 1) # Split into max 2 parts (command and maybe explanation)
-
-            command = lines[0].strip()
-            explanation = ""
-
-            if len(lines) > 1 and lines[1].strip().startswith("Explanation:"):
-                explanation = lines[1].replace("Explanation:", "", 1).strip() # Use replace with count 1
-            elif len(lines) == 1:
-                 print(f"{yellow}Warning:{reset} AI only provided the command, no explanation line found.{reset}")
-                 # Optionally, you could make another call here to get just the explanation, but let's keep it simple for now.
-            else:
-                 print(f"{yellow}Warning:{reset} AI response format might be unexpected. Got:\n{response_text}{reset}")
-                 # Still try to return the first line as command if possible
-
-            if not command: # If the first line (command) is empty, it's an error
+            command, explanation, note = parse_ai_response(response.text)
+            if not command: # Empty command means the reply was unusable
                 return None, None, f"{red}AI response did not contain a command.{reset}"
-
+            if note:
+                print(f"{yellow}Warning:{reset} {note}{reset}")
             return command, explanation, None # Return command, explanation, and None for error
 
         else:
@@ -200,10 +215,10 @@ def explain_command(command_input):
         return f"{red}Couldn't get an explanation due to an error.{reset}"
 
 # Lets load some custom shortcuts (aliases) if the user made any
-def load_aliases():
+def load_aliases(alias_file=None):
     """Loads user-defined aliases from a '.px_aliases' file if it exists."""
     aliases = {}
-    alias_file = ".px_aliases" # Define filename
+    alias_file = alias_file or ALIAS_PATH # Define filename
     if os.path.exists(alias_file):
         print(f"{blue}Found {alias_file}! Loading custom shortcuts...{reset}")
         try:
@@ -228,11 +243,26 @@ def load_aliases():
         print(f"{blue}No {alias_file} file found. You can create one (e.g., !logs=dir C:\\logs).{reset}")
     return aliases
 
-# --- Load em up! ---
-aliases = load_aliases()
+if __name__ == "__main__":
+    # === Part 1: Setting up the AI ===
+    api_key = load_api_key()
+    # Configure the genai library, adding safety settings to reduce harmful content generation
+    try:
+        genai.configure(api_key=api_key)
+        # Create the model instance once here if possible, reduces overhead
+        model = genai.GenerativeModel(AI_MODEL_NAME)
+        print(f"{green}AI Model configured successfully with safety settings.{reset}")
+    except Exception as config_err:
+        print(f"{red}Fatal Error configuring the AI Model: {config_err}{reset}")
+        print(f"{red}This might be due to an invalid API key or network issues.{reset}")
+        sys.exit(1) # Exit if we can't configure the AI
 
-# The fancy welcome screen!
-banner = fr""" {green}
+
+    # --- Load em up! ---
+    aliases = load_aliases()
+
+    # The fancy welcome screen!
+    banner = fr""" {green}
 ##################################################
 #     _    _        ____ __  __ ____      __  __ #
 #    / \  (_)      / ___|  \/  |  _ \     \ \/ / #
@@ -245,195 +275,199 @@ banner = fr""" {green}
       {gold}Your personal AI-powered CMD assistant{reset}
 {reset}
 """
-print(banner)
+    print(banner)
 
-# Function to let the user pick a mode: quick or interactive
-def mode_selection():
-    """Asks the user to choose between quick (run now) or interactive (ask first) mode."""
-    while True:
-        print(f"{purple}Select Operating Mode:{reset}")
-        # Added clarification about risk assessment
-        print(f"{gold}[1] Quick Mode{reset}{blue}\t\t(Commands run after AI risk check & your confirmation if risky){reset}")
-        print(f"{gold}[2] Interactive Mode{reset}  {blue}(Shows command/explanation/risk, then asks to run/copy/cancel){reset}")
-        print(f"{gold}[3] Exit{reset}{blue}\t\t(Quit the application){reset}")
-        choice = input(f"{green}\nEnter your choice (1, 2, or 3): {reset}").strip()
-        if choice == "1":
-            return "quick"
-        elif choice == "2":
-            return "interactive"
-        elif choice == "3":
-            print(f"{red}Okay, exiting Ai-CMD-X. Catch ya later!{reset}")
-            sys.exit()
-        else:
-            print(f"{red}Heh, '{choice}' isn't one of the options. Try again with 1, 2, or 3.{reset}\n")
-
-# Function to execute the command and handle output/logging
-def run_command_safely(command, mode, user_input_for_log):
-    """Executes the command, streams output, checks for admin issues, and logs."""
-    print(f"{gold}\n~ Attempting to run command... fingers crossed!{reset}\n{cyan}--- Command Output Start ---\n{reset}")
-    output_log = ""
-    process = None # Initialize process to None
-    try:
-        # Use Popen for better control and streaming output
-        process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True, encoding='utf-8', errors='replace')
-
-        # Read and print output line by line
-        for line in process.stdout:
-            print(line, end="")
-            output_log += line
-
-        process.wait() # Wait for the command to complete
-        print(f"{cyan}\n--- Command Output End ---{reset}") # Add newline for clarity
-
-        # Check exit code
-        if process.returncode != 0:
-             print(f"{yellow}Warning: Command exited with code {process.returncode}.{reset}")
-
-        # Check for common permission errors in output
-        output_lower = output_log.lower()
-        if "access is denied" in output_lower or "administrator privileges" in output_lower or "requires elevation" in output_lower:
-            print(f"\n{red}!! Heads up: Looks like that command might need Administrator powers.{reset}")
-            print(f"{red}!! Try running this script again as an Administrator if it didn't work.{reset}")
-
-        # Log successful execution
-        try:
-            with open("history.log", "a", encoding='utf-8') as log_file:
-                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                log_file.write(f"[{timestamp}] Mode: {mode}, Request: '{user_input_for_log}', Ran: '{command}'\n")
-        except Exception as log_e:
-            print(f"{red}Minor issue: Couldn't write to history.log file. Error: {log_e}{reset}")
-
-    except FileNotFoundError:
-         # Extract the base command name for a clearer error message
-         base_cmd = command.split()[0] if command else "the command"
-         print(f"{red}Error: The command '{base_cmd}' wasn't found on your system. Is it installed and in your PATH?{reset}")
-    except subprocess.TimeoutExpired:
-         print(f"{red}Error: The command timed out.{reset}")
-         if process: process.kill() # Terminate the timed-out process
-    except Exception as run_err:
-        print(f"{red}Oof, error occurred while *running* the command: {run_err}{reset}")
-        print(f"{red}The command was: {purple}{command}{reset}")
-
-
-# ==================
-# The MAIN Loop!
-# ==================
-while True:
-    mode = mode_selection()
-    print(f"\n{cyan}Okay, {reset}{gold}{mode.capitalize()}{reset} {cyan} Mode activated. Enter your request or type 'back'/'quit'.{reset}")
-
-    while True:
-        # Get user input
-        print(f"{green}\nAi-CMD-X ({mode})> {reset}", end="") # Changed prompt slightly
-        user_input = input().strip()
-
-        # Handle control commands
-        if not user_input: # Skip empty input
-             continue
-        if user_input.lower() in ["quit", "exit"]:
-            print(f"\n{red}Alright, shutting down Ai-CMD-X. Hope it was helpful!{reset}")
-            sys.exit()
-        if user_input.lower() == "back":
-            print(f"{blue}\n~ Okay, going back to mode selection...\n{reset}")
-            break # Breaks inner loop, goes back to mode_selection()
-
-        # Handle explanation requests
-        if user_input.lower().startswith(("explain ", "what is ", "what's ")):
-            print(f"{blue}You want an explanation for '{user_input}'? Let me ask the AI...{reset}")
-            explanation_text = explain_command(user_input)
-            print(f"{gold}\nAI Explanation:\n{reset}{explanation_text}{reset}")
-            continue # Ask for next input
-
-        # Handle aliases
-        original_request = user_input # Keep original request for logging
-        if user_input.startswith("!") and user_input[1:] in aliases:
-            alias_name = user_input[1:]
-            user_input = aliases[alias_name]
-            print(f"{blue}~ Used alias '!{alias_name}' -> Translating request to: '{user_input}'{reset}")
-            # Note: The user_input is now the command itself, AI won't be called for command generation.
-            # We might want to skip AI generation and go straight to risk check/execution for aliases,
-            # OR let the AI process the *expanded* command for consistency?
-            # Let's proceed to AI generation with the expanded command for now, it might refine it.
-
-        # --- Get Command and Explanation from AI ---
-        print(f"{blue}\nOkay, asking the AI for a command and explanation for '{user_input}'...{reset}")
-        command, explanation, error_msg = gemini_command_and_explanation(user_input)
-
-        if error_msg:
-            print(error_msg) # Print the specific error from the function
-            continue # Ask for next input
-
-        if not command: # Should be caught by error_msg, but double check
-            print(f"{red}AI failed to provide a command. Please try again.{reset}")
-            continue
-
-        # --- Risk Validation Step ---
-        print(f"{cyan}Checking command for potential risks...{reset}")
-        risk_explanation = validate_command_risk(command)
-
-        # --- Display Suggested Command, Explanation, and Risk ---
-        print(f"\n{gold} AI Suggests:{reset}")
-        print(f" Command:  {purple}{command}{reset}") # Display command
-        
-        if explanation:
-             print(f" {cyan}Explanation: {explanation}{reset}") # Display explanation
-             
-        if risk_explanation:
-            # Display risk warning prominently
-  
-            print(f"{yellow}\n!! {red}WARNING: POTENTIALLY RISKY COMMAND DETECTED!{reset}{yellow} !!{reset}")
-            print(f"{gold}!! Risk:{reset} {risk_explanation}{reset}")
-
-
-
-        # --- Mode-Dependent Action ---
-
-        # QUICK MODE: Run immediately IF NOT RISKY, otherwise CONFIRM
-        if mode == "quick":
-            if risk_explanation:
-                # Ask for confirmation BECAUSE it's risky
-                confirm_risk = input(f"{red}\n This command is flagged as risky. Execute anyway? (y/n): {reset}").strip().lower()
-                if confirm_risk in ['y', 'yes']:
-                    print(f"{blue}Proceeding with risky command based on your confirmation.{reset}")
-                    run_command_safely(command, mode, original_request)
-                else:
-                    print(f"{gold}~ Risky command execution cancelled by user.{reset}")
-                    # No logging here as it wasn't run
+    # Function to let the user pick a mode: quick or interactive
+    def mode_selection():
+        """Asks the user to choose between quick (run now) or interactive (ask first) mode."""
+        while True:
+            print(f"{purple}Select Operating Mode:{reset}")
+            # Added clarification about risk assessment
+            print(f"{gold}[1] Quick Mode{reset}{blue}\t\t(Commands run after AI risk check & your confirmation if risky){reset}")
+            print(f"{gold}[2] Interactive Mode{reset}  {blue}(Shows command/explanation/risk, then asks to run/copy/cancel){reset}")
+            print(f"{gold}[3] Exit{reset}{blue}\t\t(Quit the application){reset}")
+            choice = input(f"{green}\nEnter your choice (1, 2, or 3): {reset}").strip()
+            if choice == "1":
+                return "quick"
+            elif choice == "2":
+                return "interactive"
+            elif choice == "3":
+                print(f"{red}Okay, exiting Ai-CMD-X. Catch ya later!{reset}")
+                sys.exit()
             else:
-                # Not risky, run immediately in Quick mode
-                print(f"{gold}\n (Quick Mode)...{reset}")
-                run_command_safely(command, mode, original_request)
+                print(f"{red}Heh, '{choice}' isn't one of the options. Try again with 1, 2, or 3.{reset}\n")
 
-        # INTERACTIVE MODE: Always ask user (run, copy, cancel)
-        elif mode == "interactive":
-            # Ask the user what they wanna do: run, cancel, or copy
-            action = input(f"{green}\nAction? (y/yes=Run, c/copy=Copy, n/no=Cancel): {reset}").strip().lower()
+    # Function to execute the command and handle output/logging
+    def run_command_safely(command, mode, user_input_for_log):
+        """Executes the command, streams output, checks for admin issues, and logs."""
+        print(f"{gold}\n~ Attempting to run command... fingers crossed!{reset}\n{cyan}--- Command Output Start ---\n{reset}")
+        output_log = ""
+        process = None # Initialize process to None
+        try:
+            # Use Popen for better control and streaming output
+            process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True, encoding='utf-8', errors='replace')
 
-            if action in ["c", "copy"]:
-                try:
-                    # Use powershell's Set-Clipboard for potentially better compatibility
-                    subprocess.run(['powershell', '-Command', f'Set-Clipboard -Value "{command.replace("\"", "`\"")}"'], check=True, shell=True)
-                    # Escaping quotes might be needed depending on command complexity
-                    # os.system(f"echo {command.strip()} | clip") # Old method, might fail with complex commands
-                    print(f"{green}\n~ Command copied to clipboard!{reset}")
-                except Exception as e:
-                    print(f"{red}Couldn't copy to clipboard automatically. Error: {e}{reset}")
-                    print(f"{red}You can still copy it manually: {purple}{command}{reset}")
-                # continue: In interactive mode, after copy/cancel/error, always go back to ask for new input
+            # Read and print output line by line
+            for line in process.stdout:
+                print(line, end="")
+                output_log += line
 
-            elif action in ["n", "no", "cancel"]:
-                print(f"{gold}\n~ Command cancelled.{reset}")
-                # continue
+            process.wait() # Wait for the command to complete
+            print(f"{cyan}\n--- Command Output End ---{reset}") # Add newline for clarity
 
-            elif action in ["y", "yes", "run"]:
-                # User confirmed execution
-                run_command_safely(command, mode, original_request)
+            # Check exit code
+            if process.returncode != 0:
+                 print(f"{yellow}Warning: Command exited with code {process.returncode}.{reset}")
 
-            else: # Unrecognised option
-                print(f"{gold}Unrecognised option ('{action}'). Cancelling command.{reset}")
-                # continue
+            # Check for common permission errors in output
+            output_lower = output_log.lower()
+            if "access is denied" in output_lower or "administrator privileges" in output_lower or "requires elevation" in output_lower:
+                print(f"\n{red}!! Heads up: Looks like that command might need Administrator powers.{reset}")
+                print(f"{red}!! Try running this script again as an Administrator if it didn't work.{reset}")
 
-# This part of the script is technically unreachable because of the infinite loops
-# and sys.exit(), but it's good practice that the script *could* end if loops were different.
-    print("Exiting Ai-CMD-X.")
+            # Log successful execution
+            try:
+                with open(HISTORY_PATH, "a", encoding='utf-8') as log_file:
+                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    log_file.write(f"[{timestamp}] Mode: {mode}, Request: '{user_input_for_log}', Ran: '{command}'\n")
+            except Exception as log_e:
+                print(f"{red}Minor issue: Couldn't write to history.log file. Error: {log_e}{reset}")
+
+        except FileNotFoundError:
+             # Extract the base command name for a clearer error message
+             base_cmd = command.split()[0] if command else "the command"
+             print(f"{red}Error: The command '{base_cmd}' wasn't found on your system. Is it installed and in your PATH?{reset}")
+        except subprocess.TimeoutExpired:
+             print(f"{red}Error: The command timed out.{reset}")
+             if process: process.kill() # Terminate the timed-out process
+        except Exception as run_err:
+            print(f"{red}Oof, error occurred while *running* the command: {run_err}{reset}")
+            print(f"{red}The command was: {purple}{command}{reset}")
+
+
+    # ==================
+    # The MAIN Loop!
+    # ==================
+    while True:
+        mode = mode_selection()
+        print(f"\n{cyan}Okay, {reset}{gold}{mode.capitalize()}{reset} {cyan} Mode activated. Enter your request or type 'back'/'quit'.{reset}")
+
+        while True:
+            # Get user input
+            print(f"{green}\nAi-CMD-X ({mode})> {reset}", end="") # Changed prompt slightly
+            user_input = input().strip()
+
+            # Handle control commands
+            if not user_input: # Skip empty input
+                 continue
+            if user_input.lower() in ["quit", "exit"]:
+                print(f"\n{red}Alright, shutting down Ai-CMD-X. Hope it was helpful!{reset}")
+                sys.exit()
+            if user_input.lower() == "back":
+                print(f"{blue}\n~ Okay, going back to mode selection...\n{reset}")
+                break # Breaks inner loop, goes back to mode_selection()
+
+            # Handle explanation requests
+            if user_input.lower().startswith(("explain ", "what is ", "what's ")):
+                print(f"{blue}You want an explanation for '{user_input}'? Let me ask the AI...{reset}")
+                explanation_text = explain_command(user_input)
+                print(f"{gold}\nAI Explanation:\n{reset}{explanation_text}{reset}")
+                continue # Ask for next input
+
+            # Handle aliases
+            original_request = user_input # Keep original request for logging
+            if user_input.startswith("!") and user_input[1:] in aliases:
+                alias_name = user_input[1:]
+                user_input = aliases[alias_name]
+                print(f"{blue}~ Used alias '!{alias_name}' -> Translating request to: '{user_input}'{reset}")
+                # Note: The user_input is now the command itself, AI won't be called for command generation.
+                # We might want to skip AI generation and go straight to risk check/execution for aliases,
+                # OR let the AI process the *expanded* command for consistency?
+                # Let's proceed to AI generation with the expanded command for now, it might refine it.
+
+            # --- Get Command and Explanation from AI ---
+            print(f"{blue}\nOkay, asking the AI for a command and explanation for '{user_input}'...{reset}")
+            command, explanation, error_msg = gemini_command_and_explanation(user_input)
+
+            if error_msg:
+                print(error_msg) # Print the specific error from the function
+                continue # Ask for next input
+
+            if not command: # Should be caught by error_msg, but double check
+                print(f"{red}AI failed to provide a command. Please try again.{reset}")
+                continue
+
+            # --- Risk Validation Step ---
+            print(f"{cyan}Checking command for potential risks...{reset}")
+            risk_explanation = validate_command_risk(command)
+
+            # --- Display Suggested Command, Explanation, and Risk ---
+            print(f"\n{gold} AI Suggests:{reset}")
+            print(f" Command:  {purple}{command}{reset}") # Display command
+        
+            if explanation:
+                 print(f" {cyan}Explanation: {explanation}{reset}") # Display explanation
+             
+            if risk_explanation:
+                # Display risk warning prominently
+  
+                print(f"{yellow}\n!! {red}WARNING: POTENTIALLY RISKY COMMAND DETECTED!{reset}{yellow} !!{reset}")
+                print(f"{gold}!! Risk:{reset} {risk_explanation}{reset}")
+
+
+
+            # --- Mode-Dependent Action ---
+
+            # QUICK MODE: Run immediately IF NOT RISKY, otherwise CONFIRM
+            if mode == "quick":
+                if risk_explanation:
+                    # Ask for confirmation BECAUSE it's risky
+                    confirm_risk = input(f"{red}\n This command is flagged as risky. Execute anyway? (y/n): {reset}").strip().lower()
+                    if confirm_risk in ['y', 'yes']:
+                        print(f"{blue}Proceeding with risky command based on your confirmation.{reset}")
+                        run_command_safely(command, mode, original_request)
+                    else:
+                        print(f"{gold}~ Risky command execution cancelled by user.{reset}")
+                        # No logging here as it wasn't run
+                else:
+                    # Not risky, run immediately in Quick mode
+                    print(f"{gold}\n (Quick Mode)...{reset}")
+                    run_command_safely(command, mode, original_request)
+
+            # INTERACTIVE MODE: Always ask user (run, copy, cancel)
+            elif mode == "interactive":
+                # Ask the user what they wanna do: run, cancel, or copy
+                action = input(f"{green}\nAction? (y/yes=Run, c/copy=Copy, n/no=Cancel): {reset}").strip().lower()
+
+                if action in ["c", "copy"]:
+                    try:
+                        # 'clip' reads the command from stdin, so commands with
+                        # quotes or special characters copy over cleanly.
+                        subprocess.run("clip", input=command, text=True, shell=True,
+                                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                        print(f"{green}\n~ Command copied to clipboard!{reset}")
+                    except subprocess.CalledProcessError as e:
+                        err = e.stderr.strip() if e.stderr else ""
+                        print(f"{red}Couldn't copy to clipboard automatically. {err}{reset}")
+                        print(f"{red}You can still copy it manually: {purple}{command}{reset}")
+                    except Exception as e:
+                        print(f"{red}Couldn't copy to clipboard automatically. Error: {e}{reset}")
+                        print(f"{red}You can still copy it manually: {purple}{command}{reset}")
+                    # continue: In interactive mode, after copy/cancel/error, always go back to ask for new input
+
+                elif action in ["n", "no", "cancel"]:
+                    print(f"{gold}\n~ Command cancelled.{reset}")
+                    # continue
+
+                elif action in ["y", "yes", "run"]:
+                    # User confirmed execution
+                    run_command_safely(command, mode, original_request)
+
+                else: # Unrecognised option
+                    print(f"{gold}Unrecognised option ('{action}'). Cancelling command.{reset}")
+                    # continue
+
+    # This part of the script is technically unreachable because of the infinite loops
+    # and sys.exit(), but it's good practice that the script *could* end if loops were different.
+        print("Exiting Ai-CMD-X.")
 
